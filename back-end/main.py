@@ -1,12 +1,30 @@
 """
-Trending Tags — FastAPI Backend Service
-========================================
+Trending Tags — FastAPI Backend Service  (v3 — Redis Caching)
+=============================================================
 Two endpoints:
-  GET /get-trending-feed   — ranked trending tags with LLM enrichment
+  GET /get-trending-feed   — ranked, enriched trending tags (Redis-cached, 5 min TTL)
   GET /get-trend-details   — deep-dive for a single tag (hero media, context, feed)
 
+Redis caching strategy
+──────────────────────
+• The full pipeline (SQL → score → LLM enrich) is expensive.
+  Under a sudden spike (app opens at 8 AM for 100k users) every request
+  would hit the DB and Claude API simultaneously — caching prevents that.
+
+• Pattern used: Cache-Aside + Distributed Lock + Stale-While-Revalidate
+    1. Request arrives → check Redis for CACHE_KEY.
+    2. Cache HIT  → return cached payload instantly  [X-Cache: HIT]
+    3. Cache MISS → acquire a short-lived LOCK_KEY (SET NX EX 30s).
+       • Lock acquired   → run pipeline, write to Redis with 5-min TTL, release lock.
+       • Lock NOT acquired (another worker is already recomputing) →
+           serve STALE data if available, else wait briefly and retry once.
+    4. Redis itself is unavailable → fall through to live pipeline (degrade gracefully).
+
+This means under a thundering-herd scenario only ONE worker runs the
+expensive pipeline; every other concurrent request gets the cached result.
+
 Dependencies:
-    pip install fastapi uvicorn asyncpg anthropic python-dotenv
+    pip install fastapi uvicorn asyncpg anthropic "redis[hiredis]" python-dotenv
 """
 
 from __future__ import annotations
@@ -23,15 +41,35 @@ from typing import Optional
 
 import anthropic
 import asyncpg
-from fastapi import FastAPI, HTTPException, Query
+import redis.asyncio as aioredis
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-# ---------------------------------------------------------------------------
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 
-app = FastAPI(title="Trending Tags API", version="2.0.0")
+# ── Config ────────────────────────────────────────────────────────────────────
+DATABASE_URL  = os.environ.get("DATABASE_URL",  "postgresql://user:pass@localhost/db")
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+REDIS_URL     = os.environ.get("REDIS_URL",     "redis://localhost:6379/0")
+MODEL         = "claude-sonnet-4-20250514"
+
+# Cache keys & TTLs
+FEED_CACHE_KEY  = "trending:feed:hindi"   # stores the final JSON payload
+FEED_LOCK_KEY   = "trending:feed:lock"    # distributed lock during recompute
+STALE_CACHE_KEY = "trending:feed:stale"   # last-known-good copy, no TTL
+
+FEED_TTL_SECS   = 300    # 5 minutes — all users served from cache until refresh
+LOCK_TTL_SECS   = 30     # max seconds a worker can hold the lock
+LOCK_WAIT_SECS  = 2      # time a waiting worker sleeps before one retry
+
+MIN_VOLUME_GATE = 10     # minimum 2h posts to enter scoring pipeline
+_BASELINE_TTL   = 3600   # 1 hour baseline refresh
+
+
+# ── FastAPI app ───────────────────────────────────────────────────────────────
+app = FastAPI(title="Trending Tags API", version="3.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,12 +77,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DATABASE_URL  = os.environ.get("DATABASE_URL", "postgresql://user:pass@localhost/db")
-ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-MODEL         = "claude-sonnet-4-20250514"
-
-# Minimum 2h posts for a tag to enter the scoring pipeline
-MIN_VOLUME_GATE = 10
 
 # ===========================================================================
 # 1. DATA CONTRACTS
@@ -52,8 +84,7 @@ MIN_VOLUME_GATE = 10
 
 @dataclass
 class TagMetrics:
-    """One row from tag_trend_metrics staging table."""
-    tag: str
+    tag:               str
     current_2h_posts:  int
     prev_2h_posts:     Optional[float] = None
     avg_2h_posts_7d:   Optional[float] = None
@@ -69,7 +100,6 @@ class TagMetrics:
 
 @dataclass
 class GlobalBaselines:
-    """Platform-wide fallback averages — recomputed hourly."""
     global_avg_2h_posts:  float = 50.0
     global_avg_searches:  float = 100.0
     global_avg_likes:     float = 5.0
@@ -82,22 +112,16 @@ class GlobalBaselines:
 class ScoredTag:
     tag:           str
     trend_score:   float
-    heat_score:    float  = 0.0   # normalised 0-100 after batch
-    rank:          int    = 0
-    spike:         float  = 0.0
-    volume_log:    float  = 0.0
-    growth:        float  = 0.0
-    search_growth: float  = 0.0
-    engagement:    float  = 0.0
-    # raw signal values for argmax
-    posts_signal:  float  = 0.0   # max(spike, growth)
-    search_signal: float  = 0.0   # search_growth
-    eng_signal:    float  = 0.0   # engagement
-
-
-# Baseline cache (refreshed hourly)
-_baselines_cache: Optional[GlobalBaselines] = None
-_BASELINE_TTL = 3600
+    heat_score:    float = 0.0
+    rank:          int   = 0
+    spike:         float = 0.0
+    volume_log:    float = 0.0
+    growth:        float = 0.0
+    search_growth: float = 0.0
+    engagement:    float = 0.0
+    posts_signal:  float = 0.0
+    search_signal: float = 0.0
+    eng_signal:    float = 0.0
 
 
 # ===========================================================================
@@ -105,7 +129,6 @@ _BASELINE_TTL = 3600
 # ===========================================================================
 
 def _coalesce(primary: Optional[float], fallback: float) -> float:
-    """COALESCE logic: use own history if valid, else global average."""
     if primary is not None and primary > 0:
         return primary
     return fallback
@@ -113,31 +136,21 @@ def _coalesce(primary: Optional[float], fallback: float) -> float:
 
 def score_tag(m: TagMetrics, b: GlobalBaselines) -> Optional[ScoredTag]:
     """
-    TrendScore = Spike × log(Volume+1) × Growth × SearchGrowth × Engagement
-
-    Engagement is computed as weighted combo of likes, shares, comments
-    (mirroring the image-selection formula: likes + 2×shares + 3×comments).
+    TrendScore = Spike x log(Volume+1) x Growth x SearchGrowth x Engagement
+    Engagement = (likes + 2xshares + 3xcomments) weighted ratio vs 7d baseline.
     """
     if m.current_2h_posts < MIN_VOLUME_GATE:
         return None
 
-    # ── Spike: how unusual is this burst vs. 7-day own history ──────────
-    spike = m.current_2h_posts / _coalesce(m.avg_2h_posts_7d, b.global_avg_2h_posts)
-
-    # ── Volume: log-dampened raw count ───────────────────────────────────
+    spike      = m.current_2h_posts / _coalesce(m.avg_2h_posts_7d, b.global_avg_2h_posts)
     volume_log = math.log(m.current_2h_posts + 1)
+    growth     = m.current_2h_posts / _coalesce(m.prev_2h_posts,   b.global_avg_2h_posts)
 
-    # ── Growth: momentum vs. previous 2h window ──────────────────────────
-    growth = m.current_2h_posts / _coalesce(m.prev_2h_posts, b.global_avg_2h_posts)
-
-    # ── SearchGrowth: search intent today vs. 7d average ─────────────────
     search_growth = (
         max(m.searches_today, 1)
         / _coalesce(m.avg_searches_7d, b.global_avg_searches)
     )
 
-    # ── Engagement: weighted combo vs. 7d baseline ───────────────────────
-    # likes + 2×shares + 3×comments per post (consistent with image scoring)
     baseline_eng = (
         _coalesce(m.avg_likes_7d,    b.global_avg_likes)
         + 2 * _coalesce(m.avg_shares_7d,   b.global_avg_shares)
@@ -150,24 +163,23 @@ def score_tag(m: TagMetrics, b: GlobalBaselines) -> Optional[ScoredTag]:
 
     return ScoredTag(
         tag           = m.tag,
-        trend_score   = round(trend_score, 6),
-        spike         = round(spike,        4),
-        volume_log    = round(volume_log,   4),
-        growth        = round(growth,       4),
-        search_growth = round(search_growth,4),
-        engagement    = round(engagement,   4),
+        trend_score   = round(trend_score,      6),
+        spike         = round(spike,            4),
+        volume_log    = round(volume_log,       4),
+        growth        = round(growth,           4),
+        search_growth = round(search_growth,    4),
+        engagement    = round(engagement,       4),
         posts_signal  = round(max(spike, growth), 4),
-        search_signal = round(search_growth, 4),
-        eng_signal    = round(engagement, 4),
+        search_signal = round(search_growth,    4),
+        eng_signal    = round(engagement,       4),
     )
 
 
 def normalise_heat(scored: list[ScoredTag]) -> list[ScoredTag]:
-    """Min-max normalise trend_score → heat_score (0–100)."""
     if not scored:
         return scored
-    lo = min(s.trend_score for s in scored)
-    hi = max(s.trend_score for s in scored)
+    lo  = min(s.trend_score for s in scored)
+    hi  = max(s.trend_score for s in scored)
     rng = hi - lo or 1.0
     for s in scored:
         s.heat_score = round(((s.trend_score - lo) / rng) * 100, 1)
@@ -190,16 +202,11 @@ def rank_tags(
 
 
 # ===========================================================================
-# 3. PRIMARY SIGNAL — argmax logic
+# 3. PRIMARY SIGNAL — argmax
 # ===========================================================================
 
-SIGNAL_THRESHOLDS = {
-    "posts":      2.0,   # threshold for max(spike, growth)
-    "searches":   2.0,   # threshold for search_growth
-    "engagement": 1.5,   # threshold for engagement
-}
-
-SIGNAL_LABELS_HI = {
+SIGNAL_THRESHOLDS = {"posts": 2.0, "searches": 2.0, "engagement": 1.5}
+SIGNAL_LABELS_HI  = {
     "posts":      "अत्यधिक उपयोग",
     "searches":   "अत्यधिक खोजा गया",
     "engagement": "बहुत लोकप्रिय",
@@ -207,29 +214,17 @@ SIGNAL_LABELS_HI = {
 
 
 def assign_primary_signal(s: ScoredTag) -> str:
-    """
-    argmax: whichever signal exceeded its threshold by the greatest margin
-    is the primary signal. Falls back to the raw max if none exceed threshold.
-    """
     margins = {
         "posts":      s.posts_signal  - SIGNAL_THRESHOLDS["posts"],
         "searches":   s.search_signal - SIGNAL_THRESHOLDS["searches"],
         "engagement": s.eng_signal    - SIGNAL_THRESHOLDS["engagement"],
     }
-    # Keep only signals that cleared their threshold
     above = {k: v for k, v in margins.items() if v > 0}
-
     if above:
         winner = max(above, key=above.get)
     else:
-        # None cleared threshold — pick raw max as fallback
-        raw = {
-            "posts":      s.posts_signal,
-            "searches":   s.search_signal,
-            "engagement": s.eng_signal,
-        }
+        raw    = {"posts": s.posts_signal, "searches": s.search_signal, "engagement": s.eng_signal}
         winner = max(raw, key=raw.get)
-
     return SIGNAL_LABELS_HI[winner]
 
 
@@ -238,153 +233,219 @@ def assign_primary_signal(s: ScoredTag) -> str:
 # ===========================================================================
 
 class LLMClient:
-    """
-    Wraps Anthropic API calls.
-    All methods return parsed Python objects (never raw strings).
-    """
-
     def __init__(self, api_key: str = ANTHROPIC_KEY):
         self._client = anthropic.Anthropic(api_key=api_key)
 
     def _call(self, system: str, user: str, max_tokens: int = 2048) -> str:
         resp = self._client.messages.create(
-            model      = MODEL,
-            max_tokens = max_tokens,
-            system     = system,
-            messages   = [{"role": "user", "content": user}],
+            model=MODEL, max_tokens=max_tokens, system=system,
+            messages=[{"role": "user", "content": user}],
         )
         return resp.content[0].text.strip()
 
     @staticmethod
     def _parse_json(raw: str) -> object:
-        """Strip markdown fences if present, then parse JSON."""
         text = raw
         if text.startswith("```"):
             parts = text.split("```")
-            # parts[1] may start with 'json\n'
-            text = parts[1]
+            text  = parts[1]
             if text.lower().startswith("json"):
                 text = text[4:]
-        try:
-            return json.loads(text.strip())
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"LLM did not return valid JSON: {exc}\nRaw: {raw[:300]}")
+        return json.loads(text.strip())
 
-    # ── Step A-1: Relevance check ────────────────────────────────────────
     def check_relevance_batch(self, tags: list[str]) -> dict[str, int]:
-        """
-        Returns {tag: 0|1} — 1 = culturally relevant to India.
-        Single API call for the full batch.
-        """
-        system = """
-You are a cultural relevance filter for a Hindi-language social platform in India.
-Given a list of hashtags, classify each as:
-  1 = Culturally relevant to India (Indian events, people, places, sports, politics, entertainment, festivals, etc.)
-  0 = Obscure global trend unlikely to resonate with Hindi-speaking Indian audience
-
-Return ONLY a JSON object mapping each tag to 0 or 1.
-No preamble, no markdown, no explanation.
-Example: {"#IPL2026": 1, "#NordicSkiChampionship": 0}
-""".strip()
-
-        user = (
-            "Classify these tags for Indian cultural relevance:\n"
-            + "\n".join(tags)
+        system = (
+            "You are a cultural relevance filter for a Hindi-language social platform in India. "
+            "Given hashtags, classify each as 1 (culturally relevant to India) or 0 (obscure global trend). "
+            "Return ONLY a JSON object {tag: 0|1}. No markdown, no preamble."
         )
-        raw = self._call(system, user, max_tokens=512)
+        raw    = self._call(system, "Classify:\n" + "\n".join(tags), max_tokens=512)
         result = self._parse_json(raw)
-        # Ensure all tags present, default to 0 if LLM missed one
         return {t: int(result.get(t, 0)) for t in tags}
 
-    # ── Step A-2: Metadata generation (description + category) ──────────
-    def generate_metadata_batch(
-        self, tags: list[str]
-    ) -> dict[str, dict]:
-        """
-        Returns {tag: {description_hindi, category}} for relevant tags.
-        """
-        system = """
-You are a content metadata generator for a Hindi social media platform.
-Given trending hashtags, return a JSON object where each key is a tag and the value has:
-  "description_hindi": one punchy Hindi sentence (max 15 words) explaining why it's trending.
-                       Format: "<tag> — <Hindi context>"
-  "category": one of exactly: Sports, News, Entertainment, Lifestyle, Finance, Tech
-
-Return ONLY valid JSON. No markdown, no preamble.
-Use natural, conversational Hindi. Keep it snappy — this shows in a mobile feed.
-""".strip()
-
-        user = (
-            "Generate Hindi descriptions and categories for these trending tags:\n"
-            + "\n".join(tags)
+    def generate_metadata_batch(self, tags: list[str]) -> dict[str, dict]:
+        system = (
+            "You generate metadata for a Hindi social media platform. "
+            "Return a JSON object where each key is a tag and the value has: "
+            '"description_hindi" (one punchy Hindi sentence, max 15 words, format: "<tag> - <Hindi context>") '
+            'and "category" (one of: Sports, News, Entertainment, Lifestyle, Finance, Tech). '
+            "Return ONLY valid JSON. No markdown."
         )
-        raw = self._call(system, user, max_tokens=1024)
+        raw = self._call(system, "Generate metadata for:\n" + "\n".join(tags))
         return self._parse_json(raw)
 
-    # ── Step B: Trend context summary (for /get-trend-details) ──────────
-    def generate_trend_context(self, tag: str, post_count: int, top_posts_sample: list[str]) -> str:
-        """
-        Returns a 50-70 word Hindi context paragraph about the trend.
-        """
-        system = """
-You are a Hindi content writer for a social news platform.
-Write an "इस ट्रेंड के बारे में" (About this trend) section.
-Requirements:
-  - Exactly 50-70 Hindi words.
-  - Informative and engaging tone.
-  - Explain why the tag is trending right now in India.
-  - NO bullet points. Flowing paragraph only.
-  - Return ONLY the Hindi paragraph text. No JSON, no labels, no English.
-""".strip()
-
-        sample_text = "\n".join(f"- {p}" for p in post_samples[:5]) if (post_samples := top_posts_sample) else "No sample posts available."
-        user = (
-            f"Tag: {tag}\n"
-            f"Post count in last 2 hours: {post_count}\n"
-            f"Sample post text:\n{sample_text}\n\n"
-            "Write the Hindi trend context paragraph."
+    def generate_trend_context(self, tag: str, post_count: int, samples: list[str]) -> str:
+        system = (
+            "You write Hindi content for a social news platform. "
+            "Write an paragraph: exactly 50-70 Hindi words, "
+            "informative + engaging, flowing prose, no bullet points. "
+            "Return ONLY the Hindi paragraph. No JSON, no English."
         )
+        sample_text = "\n".join(f"- {p}" for p in samples[:5]) or "No samples."
+        user = f"Tag: {tag}\nPosts last 2h: {post_count}\nSamples:\n{sample_text}\n\nWrite the paragraph."
         return self._call(system, user, max_tokens=256)
 
 
-# Singleton LLM client (initialised once at startup)
-_llm: Optional[LLMClient] = None
+# ===========================================================================
+# 5. REDIS CACHE LAYER
+# ===========================================================================
+
+class RedisCache:
+    """
+    Async Redis cache with three keys per feed:
+
+    Key                   TTL        Purpose
+    ─────────────────────────────────────────────────────────────────────────
+    trending:feed:hindi   5 min      Primary served payload. Expires naturally.
+    trending:feed:stale   none       Last-known-good copy. Never expires.
+                                     Served to concurrent requests while a
+                                     worker is recomputing under the lock.
+    trending:feed:lock    30 s       Distributed mutex. SET NX EX ensures only
+                                     one worker runs the expensive pipeline at
+                                     a time. Auto-expires to recover from crashes.
+    """
+
+    def __init__(self, redis: aioredis.Redis):
+        self._r = redis
+
+    # ── Read ─────────────────────────────────────────────────────────────────
+
+    async def get_feed(self) -> Optional[dict]:
+        """Return cached feed payload or None on miss / Redis error."""
+        try:
+            raw = await self._r.get(FEED_CACHE_KEY)
+            if raw:
+                logger.info("Cache HIT  key=%s", FEED_CACHE_KEY)
+                return json.loads(raw)
+        except Exception as exc:
+            logger.warning("Redis GET failed: %s", exc)
+        return None
+
+    async def get_stale_feed(self) -> Optional[dict]:
+        """Return stale copy — used while lock is held by another worker."""
+        try:
+            raw = await self._r.get(STALE_CACHE_KEY)
+            if raw:
+                logger.info("Serving STALE copy while recompute in progress")
+                return json.loads(raw)
+        except Exception as exc:
+            logger.warning("Redis STALE GET failed: %s", exc)
+        return None
+
+    # ── Write ────────────────────────────────────────────────────────────────
+
+    async def set_feed(self, payload: dict) -> None:
+        """
+        Atomically write fresh payload to both the primary (TTL=5min) and
+        the stale (no TTL) keys using a pipeline to avoid partial writes.
+        """
+        serialised = json.dumps(payload, ensure_ascii=False)
+        try:
+            pipe = self._r.pipeline()
+            pipe.setex(FEED_CACHE_KEY,  FEED_TTL_SECS, serialised)  # expires in 5 min
+            pipe.set(STALE_CACHE_KEY,   serialised)                  # never expires
+            await pipe.execute()
+            logger.info(
+                "Cache SET  key=%s  TTL=%ds  bytes=%d",
+                FEED_CACHE_KEY, FEED_TTL_SECS, len(serialised),
+            )
+        except Exception as exc:
+            logger.error("Redis SET failed (result still returned): %s", exc)
+
+    # ── Distributed lock ─────────────────────────────────────────────────────
+
+    async def acquire_lock(self) -> bool:
+        """
+        Atomic SET NX EX — returns True if this worker won the lock.
+
+        NX  = set only if key does NOT exist  (exactly one winner)
+        EX  = auto-expire after LOCK_TTL_SECS (protects against crashed workers)
+        """
+        try:
+            result = await self._r.set(
+                FEED_LOCK_KEY, "1",
+                nx=True,           # only set if NOT exists
+                ex=LOCK_TTL_SECS,  # auto-release after 30s
+            )
+            acquired = result is True
+            logger.info("Lock %s  key=%s", "ACQUIRED" if acquired else "CONTESTED", FEED_LOCK_KEY)
+            return acquired
+        except Exception as exc:
+            # Redis down: allow worker to proceed rather than hang indefinitely
+            logger.warning("Redis lock acquire failed (%s) — proceeding unlocked", exc)
+            return True
+
+    async def release_lock(self) -> None:
+        try:
+            await self._r.delete(FEED_LOCK_KEY)
+            logger.info("Lock RELEASED  key=%s", FEED_LOCK_KEY)
+        except Exception as exc:
+            # Lock has LOCK_TTL_SECS auto-expiry — safe to ignore release failure
+            logger.warning("Redis lock release failed (will auto-expire): %s", exc)
+
+    async def ttl(self) -> int:
+        """Seconds remaining on the primary cache key. -2 = key not set."""
+        try:
+            return await self._r.ttl(FEED_CACHE_KEY)
+        except Exception:
+            return -2
+
+
+# ===========================================================================
+# 6. SINGLETONS — initialised once at startup
+# ===========================================================================
+
+_db_pool:         Optional[asyncpg.Pool]  = None
+_redis_client:    Optional[aioredis.Redis] = None
+_cache:           Optional[RedisCache]     = None
+_llm:             Optional[LLMClient]      = None
+_baselines_cache: Optional[GlobalBaselines] = None
 
 
 @app.on_event("startup")
 async def startup():
-    global _llm
+    global _db_pool, _redis_client, _cache, _llm
+
     _llm = LLMClient()
-    logger.info("LLMClient initialised")
+    logger.info("LLMClient ready")
 
-
-# ===========================================================================
-# 5. DATABASE HELPERS
-# ===========================================================================
-
-async def get_db_pool() -> asyncpg.Pool:
-    """Return (or create) the connection pool. Call once at startup in prod."""
-    return await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
-
-
-_db_pool: Optional[asyncpg.Pool] = None
-
-
-@app.on_event("startup")
-async def init_db():
-    global _db_pool
     try:
         _db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
-        logger.info("DB pool created")
+        logger.info("DB pool ready")
     except Exception as exc:
-        logger.warning("DB unavailable (%s) — endpoints will use mock data", exc)
+        logger.warning("DB unavailable (%s) — using mock data", exc)
 
+    try:
+        _redis_client = aioredis.from_url(
+            REDIS_URL,
+            encoding="utf-8",
+            decode_responses=True,
+            socket_connect_timeout=2,   # fail fast — don't block startup
+            socket_timeout=2,
+        )
+        await _redis_client.ping()
+        _cache = RedisCache(_redis_client)
+        logger.info("Redis ready  url=%s", REDIS_URL)
+    except Exception as exc:
+        logger.warning("Redis unavailable (%s) — caching disabled", exc)
+        _cache = None
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    if _db_pool:
+        await _db_pool.close()
+    if _redis_client:
+        await _redis_client.aclose()
+
+
+# ===========================================================================
+# 7. DATABASE HELPERS
+# ===========================================================================
 
 async def fetch_tag_metrics() -> list[TagMetrics]:
-    """Read pre-aggregated metrics from staging table."""
     if not _db_pool:
         return _mock_metrics()
-
     rows = await _db_pool.fetch("""
         SELECT tag, current_2h_posts, prev_2h_posts, avg_2h_posts_7d,
                avg_likes_24h, avg_shares_24h, avg_comments_24h,
@@ -399,21 +460,18 @@ async def fetch_tag_metrics() -> list[TagMetrics]:
 
 
 async def fetch_global_baselines() -> GlobalBaselines:
-    """Cache baselines for 1 hour."""
     global _baselines_cache
     if _baselines_cache and (time.time() - _baselines_cache.cached_at) < _BASELINE_TTL:
         return _baselines_cache
-
     if not _db_pool:
         _baselines_cache = GlobalBaselines()
         return _baselines_cache
-
     row = await _db_pool.fetchrow("""
-        SELECT AVG(current_2h_posts)  AS global_avg_2h_posts,
-               AVG(searches_today)    AS global_avg_searches,
-               AVG(avg_likes_24h)     AS global_avg_likes,
-               AVG(avg_shares_24h)    AS global_avg_shares,
-               AVG(avg_comments_24h)  AS global_avg_comments
+        SELECT AVG(current_2h_posts) AS global_avg_2h_posts,
+               AVG(searches_today)   AS global_avg_searches,
+               AVG(avg_likes_24h)    AS global_avg_likes,
+               AVG(avg_shares_24h)   AS global_avg_shares,
+               AVG(avg_comments_24h) AS global_avg_comments
         FROM   tag_trend_metrics
         WHERE  computed_at >= NOW() - INTERVAL '1 hour'
     """)
@@ -428,12 +486,9 @@ async def fetch_global_baselines() -> GlobalBaselines:
 
 
 async def fetch_hero_media(tag: str) -> Optional[dict]:
-    """Most-engaged post with image/video for a tag (last 24h)."""
     if not _db_pool:
         return {"image_url": "https://images.unsplash.com/photo-1531415074968-036ba1b575da?w=800&q=80",
-                "video_url": None, "likes": 5100, "shares": 1800, "comments": 1240,
-                "engagement_score": 5100 + 1800 + 1240}
-
+                "video_url": None, "likes": 5100, "shares": 1800, "comments": 1240, "engagement_score": 8140}
     row = await _db_pool.fetchrow("""
         SELECT p.post_id, p.image_url, p.video_url,
                (p.likes + p.shares + p.comments) AS engagement_score,
@@ -451,18 +506,16 @@ async def fetch_hero_media(tag: str) -> Optional[dict]:
 
 
 async def fetch_related_feed(tag: str, limit: int = 20) -> list[dict]:
-    """Recent posts for the trend mini-feed."""
     if not _db_pool:
         return _mock_feed(tag)
-
     rows = await _db_pool.fetch("""
         SELECT p.post_id, p.user_id, u.display_name, u.avatar_url,
                p.content, p.image_url, p.video_url,
                p.likes, p.shares, p.comments, p.created_at
-        FROM   posts  p
+        FROM   posts p
         INNER JOIN users u ON u.user_id = p.user_id
         INNER JOIN (SELECT user_id FROM users WHERE language='hindi') hf
-               ON  hf.user_id = p.user_id
+               ON hf.user_id = p.user_id
         WHERE  $1 = ANY(p.tags)
         ORDER  BY p.created_at DESC
         LIMIT  $2
@@ -471,10 +524,8 @@ async def fetch_related_feed(tag: str, limit: int = 20) -> list[dict]:
 
 
 async def fetch_post_text_samples(tag: str, n: int = 5) -> list[str]:
-    """Sample post text for LLM context generation."""
     if not _db_pool:
         return ["क्रिकेट का रोमांचक मैच आज रात", "शानदार प्रदर्शन, दर्शक झूमे"]
-
     rows = await _db_pool.fetch("""
         SELECT content FROM posts
         WHERE  $1 = ANY(tags)
@@ -487,58 +538,54 @@ async def fetch_post_text_samples(tag: str, n: int = 5) -> list[str]:
 
 
 # ===========================================================================
-# 6. ENDPOINT #1: GET /get-trending-feed
+# 8. PIPELINE  — expensive; runs at most once per FEED_TTL_SECS
 # ===========================================================================
 
-@app.get("/get-trending-feed")
-async def get_trending_feed(limit: int = Query(default=10, ge=1, le=30)):
+async def _run_pipeline(limit: int) -> dict:
     """
-    3-step pipeline:
-      Step A — LLM relevance check + metadata generation
-      Step B — Python argmax primary signal assignment
-      Returns ranked, enriched trending tags for Hindi users in India.
+    Full SQL -> score -> LLM enrich pipeline.
+    Called only when the cache is cold AND this worker holds the lock.
     """
-    # ── Fetch & score ─────────────────────────────────────────────────────
+    t0 = time.perf_counter()
+
     metrics   = await fetch_tag_metrics()
     baselines = await fetch_global_baselines()
-    scored    = rank_tags(metrics, baselines, top_n=limit * 2)  # over-fetch for filtering
+    scored    = rank_tags(metrics, baselines, top_n=limit * 2)
 
     if not scored:
-        return JSONResponse(content={"tags": [], "generated_at": _now()})
+        return {"tags": [], "total_scored": 0, "total_relevant": 0,
+                "generated_at": _now(), "pipeline_ms": 0}
 
     tags_list = [s.tag for s in scored]
 
-    # ── Step A-1: Relevance check ─────────────────────────────────────────
+    # Step A-1: Relevance filter (LLM)
     try:
         relevance = _llm.check_relevance_batch(tags_list)
     except Exception as exc:
         logger.error("Relevance check failed: %s", exc)
-        relevance = {t: 1 for t in tags_list}   # fail-open: keep all tags
+        relevance = {t: 1 for t in tags_list}
 
-    relevant_tags = [s for s in scored if relevance.get(s.tag, 0) == 1]
+    relevant = [s for s in scored if relevance.get(s.tag, 0) == 1]
 
-    # ── Step A-2: Metadata generation ─────────────────────────────────────
-    relevant_names = [s.tag for s in relevant_tags]
+    # Step A-2: Hindi description + category (LLM)
     try:
-        metadata = _llm.generate_metadata_batch(relevant_names)
+        metadata = _llm.generate_metadata_batch([s.tag for s in relevant])
     except Exception as exc:
         logger.error("Metadata generation failed: %s", exc)
-        metadata = {t: {"description_hindi": f"{t} — विवरण उपलब्ध नहीं।",
-                        "category": "News"}
-                    for t in relevant_names}
+        metadata = {s.tag: {"description_hindi": f"{s.tag} — विवरण उपलब्ध नहीं।",
+                             "category": "News"} for s in relevant}
 
-    # ── Step B: Primary signal assignment ────────────────────────────────
+    # Step B: Primary signal (pure Python)
     output = []
-    for s in relevant_tags[:limit]:
-        meta    = metadata.get(s.tag, {})
-        signal  = assign_primary_signal(s)
+    for s in relevant[:limit]:
+        meta = metadata.get(s.tag, {})
         output.append({
             "rank":              s.rank,
             "tag":               s.tag,
             "description_hindi": meta.get("description_hindi", f"{s.tag} — विवरण उपलब्ध नहीं।"),
             "category":          meta.get("category", "News"),
             "heat_score":        s.heat_score,
-            "primary_signal":    signal,
+            "primary_signal":    assign_primary_signal(s),
             "score_breakdown": {
                 "spike":         s.spike,
                 "growth":        s.growth,
@@ -547,50 +594,134 @@ async def get_trending_feed(limit: int = Query(default=10, ge=1, le=30)):
             },
         })
 
-    return JSONResponse(content={
-        "tags":          output,
-        "total_scored":  len(scored),
-        "total_relevant":len(relevant_tags),
-        "generated_at":  _now(),
-    })
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    logger.info("Pipeline done  %dms  tags=%d", elapsed_ms, len(output))
+
+    return {
+        "tags":           output,
+        "total_scored":   len(scored),
+        "total_relevant": len(relevant),
+        "generated_at":   _now(),
+        "pipeline_ms":    elapsed_ms,
+    }
 
 
 # ===========================================================================
-# 7. ENDPOINT #2: GET /get-trend-details
+# 9. ENDPOINT #1: GET /get-trending-feed  (Redis-cached, 5-min TTL)
+# ===========================================================================
+
+@app.get("/get-trending-feed")
+async def get_trending_feed(limit: int = Query(default=10, ge=1, le=30)):
+    """
+    Cache-Aside + Distributed Lock + Stale-While-Revalidate
+
+    Decision tree for every incoming request:
+
+        Redis offline?
+          YES  -> run pipeline live, return  [X-Cache: BYPASS]
+
+        Cache HIT?
+          YES  -> return cached payload      [X-Cache: HIT]
+
+        Cache MISS + lock acquired?
+          YES  -> run pipeline, write cache, [X-Cache: MISS]
+                  release lock, return
+
+        Cache MISS + lock CONTESTED?
+          stale copy exists? -> return stale [X-Cache: STALE]
+          no stale?          -> sleep 2s, retry cache once
+            cache now populated? -> return  [X-Cache: HIT]
+            still empty?         -> run pipeline as last resort
+
+    Result: under a thundering herd, only ONE worker runs the expensive
+    pipeline. Every other concurrent request gets the cached result with
+    zero additional DB or LLM cost.
+    """
+
+    # ── Redis offline: degrade gracefully ────────────────────────────────
+    if _cache is None:
+        logger.warning("Redis offline — live pipeline (no cache)")
+        payload = await _run_pipeline(limit)
+        payload["cache_status"] = "BYPASS"
+        return JSONResponse(content=payload, headers={"X-Cache": "BYPASS", "X-Cache-TTL": "0"})
+
+    # ── Cache HIT ─────────────────────────────────────────────────────────
+    cached = await _cache.get_feed()
+    if cached is not None:
+        remaining = await _cache.ttl()
+        cached["cache_status"] = "HIT"
+        return JSONResponse(
+            content=cached,
+            headers={"X-Cache": "HIT", "X-Cache-TTL": str(max(remaining, 0))},
+        )
+
+    # ── Cache MISS: race for the recompute lock ────────────────────────
+    lock_acquired = await _cache.acquire_lock()
+
+    if not lock_acquired:
+        # Another worker holds the lock and is recomputing right now.
+        # Serve stale immediately — no point waiting when we have prior data.
+        stale = await _cache.get_stale_feed()
+        if stale is not None:
+            stale["cache_status"] = "STALE"
+            return JSONResponse(
+                content=stale,
+                headers={"X-Cache": "STALE", "X-Cache-TTL": "0"},
+            )
+
+        # First-ever cold start under high concurrency — no stale data yet.
+        # Sleep briefly and retry once before giving up and running ourselves.
+        logger.info("No stale data — waiting %.1fs for lock holder to finish", LOCK_WAIT_SECS)
+        await asyncio.sleep(LOCK_WAIT_SECS)
+        fresh = await _cache.get_feed()
+        if fresh is not None:
+            fresh["cache_status"] = "HIT_AFTER_WAIT"
+            return JSONResponse(
+                content=fresh,
+                headers={"X-Cache": "HIT", "X-Cache-TTL": str(FEED_TTL_SECS)},
+            )
+        logger.warning("Lock wait expired with no data — running pipeline as fallback")
+
+    # ── Lock held (or Redis lock unavailable): run the pipeline ──────────
+    try:
+        payload = await _run_pipeline(limit)
+        payload["cache_status"] = "MISS"
+        await _cache.set_feed(payload)          # write primary + stale atomically
+        return JSONResponse(
+            content=payload,
+            headers={"X-Cache": "MISS", "X-Cache-TTL": str(FEED_TTL_SECS)},
+        )
+    finally:
+        # Always release — even if _run_pipeline raised an exception
+        if lock_acquired:
+            await _cache.release_lock()
+
+
+# ===========================================================================
+# 10. ENDPOINT #2: GET /get-trend-details  (live — per-tag, not cached)
 # ===========================================================================
 
 @app.get("/get-trend-details")
 async def get_trend_details(tag_name: str = Query(..., description="e.g. #IPL2026")):
-    """
-    Deep-dive for a single tag:
-      1. Hero image/video (most engaged post, last 24h)
-      2. LLM context summary in Hindi (50-70 words)
-      3. Related mini-feed (20 most recent posts)
-    """
     if not tag_name.startswith("#"):
         tag_name = f"#{tag_name}"
 
-    # Parallelise I/O-bound fetches
-    hero_task, feed_task, sample_task = await asyncio.gather(
+    hero_result, feed_result, sample_result = await asyncio.gather(
         fetch_hero_media(tag_name),
         fetch_related_feed(tag_name),
         fetch_post_text_samples(tag_name),
         return_exceptions=True,
     )
+    hero    = hero_result   if not isinstance(hero_result,   Exception) else None
+    feed    = feed_result   if not isinstance(feed_result,   Exception) else []
+    samples = sample_result if not isinstance(sample_result, Exception) else []
 
-    hero   = hero_task   if not isinstance(hero_task,   Exception) else None
-    feed   = feed_task   if not isinstance(feed_task,   Exception) else []
-    samples= sample_task if not isinstance(sample_task, Exception) else []
-
-    # LLM context summary
-    post_count = len(feed) if feed else 0
     try:
-        context_hindi = _llm.generate_trend_context(tag_name, post_count, samples)
+        context_hindi = _llm.generate_trend_context(tag_name, len(feed or []), samples)
     except Exception as exc:
         logger.error("Context generation failed: %s", exc)
         context_hindi = f"{tag_name} इस समय भारत में चर्चा में है।"
 
-    # Serialise feed (datetime → ISO string)
     serialised_feed = []
     for p in (feed or []):
         entry = dict(p)
@@ -599,25 +730,78 @@ async def get_trend_details(tag_name: str = Query(..., description="e.g. #IPL202
         serialised_feed.append(entry)
 
     return JSONResponse(content={
-        "tag":             tag_name,
-        "hero_media":      hero,
-        "context_hindi":   context_hindi,
-        "related_feed":    serialised_feed,
-        "generated_at":    _now(),
+        "tag":           tag_name,
+        "hero_media":    hero,
+        "context_hindi": context_hindi,
+        "related_feed":  serialised_feed,
+        "generated_at":  _now(),
     })
 
 
 # ===========================================================================
-# 8. HEALTH CHECK
+# 11. CACHE MANAGEMENT ENDPOINTS
+# ===========================================================================
+
+@app.get("/cache/status")
+async def cache_status():
+    """Inspect current cache state — for ops dashboards."""
+    if _cache is None:
+        return {"redis": "offline", "feed_cached": False}
+    ttl = await _cache.ttl()
+    return {
+        "redis":         "online",
+        "feed_cached":   ttl > 0,
+        "ttl_seconds":   ttl,
+        "ttl_human":     f"{ttl}s remaining" if ttl > 0 else "expired / not set",
+        "feed_key":      FEED_CACHE_KEY,
+        "stale_key":     STALE_CACHE_KEY,
+        "lock_key":      FEED_LOCK_KEY,
+        "feed_ttl_cfg":  FEED_TTL_SECS,
+    }
+
+
+@app.post("/cache/invalidate")
+async def cache_invalidate():
+    """
+    Force-expire the feed cache.
+    Use after manual data corrections or LLM prompt changes.
+    Protect with auth middleware in production.
+    """
+    if _cache is None:
+        return {"invalidated": False, "reason": "Redis offline"}
+    try:
+        deleted = await _redis_client.delete(FEED_CACHE_KEY)
+        logger.info("Cache manually invalidated  deleted=%d", deleted)
+        return {"invalidated": bool(deleted), "key": FEED_CACHE_KEY,
+                "note": "stale copy retained for in-flight requests"}
+    except Exception as exc:
+        return {"invalidated": False, "reason": str(exc)}
+
+
+# ===========================================================================
+# 12. HEALTH CHECK
 # ===========================================================================
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": MODEL, "time": _now()}
+    redis_ok = False
+    if _redis_client:
+        try:
+            await _redis_client.ping()
+            redis_ok = True
+        except Exception:
+            pass
+    return {
+        "status": "ok",
+        "db":     "online" if _db_pool  else "offline (mock data)",
+        "redis":  "online" if redis_ok  else "offline (bypass mode)",
+        "model":  MODEL,
+        "time":   _now(),
+    }
 
 
 # ===========================================================================
-# 9. HELPERS
+# 13. HELPERS + MOCK DATA
 # ===========================================================================
 
 def _now() -> str:
@@ -625,7 +809,6 @@ def _now() -> str:
 
 
 def _mock_metrics() -> list[TagMetrics]:
-    """Returned when DB is unavailable — useful for local dev / smoke tests."""
     return [
         TagMetrics(tag="#भारतvsऑस्ट्रेलिया", current_2h_posts=980,  prev_2h_posts=None,   avg_2h_posts_7d=None,   avg_likes_24h=22.0, avg_shares_24h=8.0,  avg_comments_24h=5.0, avg_likes_7d=None, searches_today=4400, avg_searches_7d=None),
         TagMetrics(tag="#MumbaiRains",         current_2h_posts=560,  prev_2h_posts=40.0,   avg_2h_posts_7d=30.0,   avg_likes_24h=12.0, avg_shares_24h=4.0,  avg_comments_24h=3.0, avg_likes_7d=5.0,  searches_today=2800, avg_searches_7d=200.0),
@@ -643,7 +826,7 @@ def _mock_metrics() -> list[TagMetrics]:
 def _mock_feed(tag: str) -> list[dict]:
     return [
         {"post_id": "p001", "display_name": "Rahul M", "avatar_url": None,
-         "content": f"क्या शानदार मैच! {tag} 🔥", "image_url": "https://images.unsplash.com/photo-1531415074968-036ba1b575da?w=400&q=70",
+         "content": f"क्या शानदार मैच! {tag}", "image_url": "https://images.unsplash.com/photo-1531415074968-036ba1b575da?w=400&q=70",
          "video_url": None, "likes": 5100, "shares": 1800, "comments": 1240, "created_at": _now()},
         {"post_id": "p002", "display_name": "Priya S", "avatar_url": None,
          "content": f"बेहतरीन प्रदर्शन {tag}", "image_url": None,
@@ -652,7 +835,7 @@ def _mock_feed(tag: str) -> list[dict]:
 
 
 # ===========================================================================
-# 10. RUN (dev)
+# 14. RUN (dev)
 # ===========================================================================
 
 if __name__ == "__main__":
