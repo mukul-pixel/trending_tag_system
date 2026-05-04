@@ -36,18 +36,22 @@ The system utilizes a 120-minute sliding window that updates every minute:
     5. User Interaction,Argmax Signal Logic,"Assigns labels like ""अत्यधिक खोजा गया"" (Highly Searched) to provide context."
        
 5. UX Rationale
+   
 The system was redesigned to move from a simple "list of words" to a data-rich experience that eliminates the "black box" nature of trending algorithms.
 
 Key Optimizations
+
         - Every tag features a driver (e.g., "Highly Searched") so users understand the "why" before clicking.
         - An info icon explains the "Heat Score" in simple Hindi.
         - "Hero Media" (top image/video) provides instant visual understanding of the trend.
 
 Layout Decisions
+
         - On mobile, a "People Also Viewed" section is injected after the first three posts to maintain discoverability.
         - To avoid clutter, the system shows the Top 5 trends on Desktop and Top 2 on Mobile, with a "View More" option for interested users.
 
 Design Rejections
+
         - Rejected purely mathematical rankings to ensure the AI filter prioritizes local, Hindi-specific relevance.
         - Rejected real-time calculation per user to prevent server bottlenecks and maintain predictable API costs.
         
