@@ -19,5 +19,5 @@ This system is aimed to build a list of daily trending tags using Maths and LLM.
        - The User Opens the App: This triggers the system to check Redis.
        - The Fast Lane: If a list was generated in the last 5 minutes, it is served instantly from the cache.
        - The Heavy Lifting: If the cache is empty, the system pulls data from the Database, runs it through the AI (LLM) for filtering, calculates the final Heat Scores, and updates the cache for the next user.
-       ![Demo](front-end/src/assets/demo.png)
+       ![Demo](front-end/src/assets/trending_tags_workflow.png)
 4. 
