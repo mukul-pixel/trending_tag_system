@@ -51,7 +51,8 @@ Design Rejections
         - Rejected purely mathematical rankings to ensure the AI filter prioritizes local, Hindi-specific relevance.
         - Rejected real-time calculation per user to prevent server bottlenecks and maintain predictable API costs.
         
-6. Next 4 Weeks Plan 
+6. Next 4 Weeks Plan
+
         1. Week 1: Multi-Lingual Expansion & Quality Assurance
                   The primary goal is to scale the existing architecture to support the full diversity of the user base while maintaining high content standards.
                 - Language Scaling: Expand the multi-factor scoring engine and LLM filtering to include all supported languages within the app.
